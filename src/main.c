@@ -31,6 +31,7 @@
 #define TOPIC_OUT "board-out"
 #define TOPIC_IN "board-in"
 
+// --- НАЛАШТУВАННЯ ПІНІВ ---
 static const gpio_num_t DHT_PIN_BATTERY = GPIO_NUM_4;
 static const gpio_num_t DHT_PIN_STREET = GPIO_NUM_5;
 static const gpio_num_t FAN_PIN = GPIO_NUM_19;
@@ -64,7 +65,35 @@ void send_to_mqtt(const char *msg)
     }
 }
 
-// --- КЕРУВАННЯ ---
+// --- КЕРУВАННЯ АПАРАТУРОЮ ---
+void hardware_init(void)
+{
+    // 1. Сервопривід
+    ledc_timer_config_t ledc_timer = {
+        .speed_mode = SERVO_LEDC_MODE,
+        .timer_num = SERVO_LEDC_TIMER,
+        .duty_resolution = SERVO_LEDC_DUTY_RES,
+        .freq_hz = SERVO_LEDC_FREQUENCY,
+        .clk_cfg = LEDC_AUTO_CLK};
+    ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
+
+    ledc_channel_config_t ledc_channel = {
+        .speed_mode = SERVO_LEDC_MODE,
+        .channel = SERVO_LEDC_CHANNEL,
+        .timer_sel = SERVO_LEDC_TIMER,
+        .intr_type = LEDC_INTR_DISABLE,
+        .gpio_num = SERVO_PIN,
+        .duty = 0,
+        .hpoint = 0};
+    ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
+
+    // 2. Вентилятор
+    gpio_reset_pin(FAN_PIN);
+    gpio_set_direction(FAN_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_level(FAN_PIN, 0);
+    current_fan_state = 0;
+}
+
 void servo_set_angle(int angle)
 {
     if (angle < 0)
@@ -73,11 +102,14 @@ void servo_set_angle(int angle)
         angle = 180;
     if (angle == current_servo_angle)
         return;
+
     uint32_t pulse_width = SERVO_MIN_PULSEWIDTH_US + ((SERVO_MAX_PULSEWIDTH_US - SERVO_MIN_PULSEWIDTH_US) * angle) / 180;
     uint32_t duty = (pulse_width * (1 << 14)) / 20000;
+
     ledc_set_duty(SERVO_LEDC_MODE, SERVO_LEDC_CHANNEL, duty);
     ledc_update_duty(SERVO_LEDC_MODE, SERVO_LEDC_CHANNEL);
     current_servo_angle = angle;
+
     char buf[32];
     snprintf(buf, sizeof(buf), "servo - %s", angle > 0 ? "open" : "closed");
     send_to_mqtt(buf);
@@ -89,6 +121,7 @@ void fan_set_state(int state)
         return;
     gpio_set_level(FAN_PIN, state);
     current_fan_state = state;
+
     char buf[32];
     snprintf(buf, sizeof(buf), "fan - %s", state ? "on" : "off");
     send_to_mqtt(buf);
@@ -111,6 +144,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         memcpy(cmd, event->data, len);
         cmd[len] = '\0';
         ESP_LOGI(TAG, "Command: %s", cmd);
+
         if (strcmp(cmd, "fan-on") == 0)
             fan_set_state(1);
         else if (strcmp(cmd, "fan-off") == 0)
@@ -129,10 +163,26 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     }
 }
 
+void mqtt_app_start(void)
+{
+    esp_mqtt_client_config_t mqtt_cfg = {
+        .broker.address.uri = MQTT_HOST,
+        .broker.address.port = MQTT_PORT,
+        .credentials.username = MQTT_USER,
+        .credentials.authentication.password = MQTT_PASS,
+        .broker.verification.crt_bundle_attach = esp_crt_bundle_attach,
+    };
+    global_mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
+    esp_mqtt_client_register_event(global_mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+    esp_mqtt_client_start(global_mqtt_client);
+}
+
 static void event_handler(void *arg, esp_event_base_t base, int32_t event_id, void *event_data)
 {
     if (base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START)
+    {
         esp_wifi_connect();
+    }
     else if (base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
     {
         if (s_retry_num < MAXIMUM_RETRY)
@@ -141,12 +191,54 @@ static void event_handler(void *arg, esp_event_base_t base, int32_t event_id, vo
             s_retry_num++;
         }
         else
+        {
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+        }
     }
     else if (base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
     {
         s_retry_num = 0;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+}
+
+void wifi_init_sta(void)
+{
+    // ОСЬ ТЕ ЩО ВИКЛИКАЛО BOOTLOOP - Створення групи подій
+    s_wifi_event_group = xEventGroupCreate();
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL, NULL));
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = WIFI_SSID,
+            .password = WIFI_PASS,
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+        },
+    };
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
+
+    if (bits & WIFI_CONNECTED_BIT)
+    {
+        ESP_LOGI(TAG, "Connected to AP");
+        mqtt_app_start();
+    }
+    else
+    {
+        ESP_LOGE(TAG, "Failed to connect to AP");
     }
 }
 
@@ -165,8 +257,12 @@ void dht_task(void *pvParameters)
     esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
     esp_sntp_setservername(0, "pool.ntp.org");
     esp_sntp_init();
-    while (sntp_get_sync_status() == SNTP_SYNC_STATUS_RESET)
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
+
+    int retry = 0;
+    while (sntp_get_sync_status() == SNTP_SYNC_STATUS_RESET && ++retry < 15)
+    {
+        vTaskDelay(2000 / portTICK_PERIOD_MS);
+    }
     setenv("TZ", "EET-2EEST,M3.5.0/3,M10.5.0/4", 1);
     tzset();
 
@@ -214,6 +310,8 @@ void dht_task(void *pvParameters)
             ESP_LOGE(TAG, "Sensor error!");
             send_to_mqtt("Error: Sensor data failure");
         }
+
+        // Засинаємо до наступної хвилини
         vTaskDelay(58000 / portTICK_PERIOD_MS);
     }
 }
@@ -221,35 +319,17 @@ void dht_task(void *pvParameters)
 // --- СТАРТ ---
 void app_main(void)
 {
-    nvs_flash_init();
+    // ВІДНОВЛЕНО ПРАВИЛЬНУ ІНІЦІАЛІЗАЦІЮ NVS (Щоб не ловити ребути через биту флешку)
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
+    {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
 
-    // Hardware
-    ledc_timer_config_t ledc_timer = {.speed_mode = SERVO_LEDC_MODE, .timer_num = SERVO_LEDC_TIMER, .duty_resolution = SERVO_LEDC_DUTY_RES, .freq_hz = SERVO_LEDC_FREQUENCY, .clk_cfg = LEDC_AUTO_CLK};
-    ledc_timer_config(&ledc_timer);
-    ledc_channel_config_t ledc_channel = {.speed_mode = SERVO_LEDC_MODE, .channel = SERVO_LEDC_CHANNEL, .timer_sel = SERVO_LEDC_TIMER, .gpio_num = SERVO_PIN, .duty = 0};
-    ledc_channel_config(&ledc_channel);
-    gpio_reset_pin(FAN_PIN);
-    gpio_set_direction(FAN_PIN, GPIO_MODE_OUTPUT);
-
-    // Network
-    esp_netif_init();
-    esp_event_loop_create_default();
-    esp_netif_create_default_wifi_sta();
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    esp_wifi_init(&cfg);
-    esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL, NULL);
-    esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL, NULL);
-    wifi_config_t wifi_config = {.sta = {.ssid = WIFI_SSID, .password = WIFI_PASS, .threshold.authmode = WIFI_AUTH_WPA2_PSK}};
-    esp_wifi_set_mode(WIFI_MODE_STA);
-    esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
-    esp_wifi_start();
-    xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
-
-    // MQTT
-    esp_mqtt_client_config_t mqtt_cfg = {.broker.address.uri = MQTT_HOST, .credentials.username = MQTT_USER, .credentials.authentication.password = MQTT_PASS, .broker.verification.crt_bundle_attach = esp_crt_bundle_attach};
-    global_mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
-    esp_mqtt_client_register_event(global_mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
-    esp_mqtt_client_start(global_mqtt_client);
+    hardware_init();
+    wifi_init_sta();
 
     xTaskCreate(&dht_task, "dht_task", 4096, NULL, 5, NULL);
 }
