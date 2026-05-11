@@ -59,7 +59,6 @@ static int current_fan_state = -1;
 void servo_set_angle(int angle);
 void fan_set_state(int state);
 
-// --- ІНІЦІАЛІЗАЦІЯ АПАРАТУРИ ---
 void hardware_init(void)
 {
     ledc_timer_config_t ledc_timer = {
@@ -121,7 +120,6 @@ void fan_set_state(int state)
     }
 }
 
-// --- ОБРОБНИК MQTT ---
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
     esp_mqtt_event_handle_t event = event_data;
@@ -130,20 +128,16 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     switch ((esp_mqtt_event_id_t)event_id)
     {
     case MQTT_EVENT_CONNECTED:
-        ESP_LOGI(TAG, "Connected to HiveMQ");
         esp_mqtt_client_subscribe(client, TOPIC_IN, 1);
         esp_mqtt_client_publish(client, TOPIC_OUT, "ESP32 Full System Online", 0, 1, 0);
         break;
     case MQTT_EVENT_DATA:
-        // Обробка вхідних команд з board-in
         if (strncmp(event->topic, TOPIC_IN, event->topic_len) == 0)
         {
             char cmd[32];
             int len = event->data_len < 31 ? event->data_len : 31;
             memcpy(cmd, event->data, len);
             cmd[len] = '\0';
-
-            ESP_LOGI(TAG, "Command received: %s", cmd);
             if (strcmp(cmd, "fan-on") == 0)
                 fan_set_state(1);
             else if (strcmp(cmd, "fan-off") == 0)
@@ -159,7 +153,6 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     }
 }
 
-// --- WI-FI ТА ІНШЕ ---
 static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START)
@@ -228,7 +221,11 @@ void obtain_time(void)
 void dht_task(void *pvParameters)
 {
     float t_batt, h_batt, t_out, h_out;
-    char mqtt_msg[64];
+    char mqtt_msg[128];
+    time_t now;
+    struct tm timeinfo;
+    char time_str[32];
+
     vTaskDelay(5000 / portTICK_PERIOD_MS);
     obtain_time();
     servo_set_angle(0);
@@ -242,7 +239,6 @@ void dht_task(void *pvParameters)
 
         if (b_ok && o_ok)
         {
-            // Твоя логіка автоматики
             if (t_batt > t_out)
             {
                 fan_set_state(1);
@@ -254,22 +250,22 @@ void dht_task(void *pvParameters)
                 servo_set_angle(0);
             }
 
-            // Відправка температури у форматі: temp 28 26
-            snprintf(mqtt_msg, sizeof(mqtt_msg), "temp %.0f %.0f", t_batt, t_out);
+            // Отримуємо поточний час
+            time(&now);
+            localtime_r(&now, &timeinfo);
+            strftime(time_str, sizeof(time_str), "%H:%M:%S", &timeinfo);
+
+            // Формат: temp 28 26 20:43:15
+            snprintf(mqtt_msg, sizeof(mqtt_msg), "temp %.0f %.0f %s", t_batt, t_out, time_str);
             esp_mqtt_client_publish(global_mqtt_client, TOPIC_OUT, mqtt_msg, 0, 1, 0);
         }
-        vTaskDelay(58000 / portTICK_PERIOD_MS); // Разом з затримкою між датчиками буде 1 хв
+        vTaskDelay(58000 / portTICK_PERIOD_MS);
     }
 }
 
 void app_main(void)
 {
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
-    {
-        nvs_flash_erase();
-        ret = nvs_flash_init();
-    }
+    nvs_flash_init();
     hardware_init();
     wifi_init_sta();
     mqtt_app_start();
